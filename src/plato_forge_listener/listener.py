@@ -1,128 +1,153 @@
-"""Forge listener — event-driven tile stream consumer with filtering and replay."""
+"""Forge listener — event listener with pattern filtering, replay, dead letter queue, multiplexing."""
 import time
-import json
+import re
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Optional, Callable
 from collections import defaultdict, deque
 from enum import Enum
 
-class EventType(Enum):
-    TILE_CREATED = "tile_created"
-    TILE_UPDATED = "tile_updated"
-    TILE_DELETED = "tile_deleted"
-    TILE_GHOSTED = "tile_ghosted"
-    TILE_RESURRECTED = "tile_resurrected"
-    ROOM_CHANGED = "room_changed"
-    FORGE_TICK = "forge_tick"
+class EventSeverity(Enum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
 
 @dataclass
 class ForgeEvent:
-    event_type: EventType
-    tile_id: str = ""
-    room: str = ""
-    data: dict = field(default_factory=dict)
+    id: str
+    event_type: str
+    source: str
+    payload: dict = field(default_factory=dict)
+    severity: EventSeverity = EventSeverity.INFO
     timestamp: float = field(default_factory=time.time)
-    sequence: int = 0
+    room: str = ""
+    metadata: dict = field(default_factory=dict)
+
+@dataclass
+class EventFilter:
+    event_types: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    rooms: list[str] = field(default_factory=list)
+    severities: list[EventSeverity] = field(default_factory=list)
+    pattern: str = ""  # regex on payload
+    min_severity: EventSeverity = EventSeverity.INFO
+
+@dataclass
+class ListenerConfig:
+    max_buffer: int = 10000
+    dead_letter_max: int = 1000
+    replay_enabled: bool = True
+    ack_timeout: float = 30.0
 
 @dataclass
 class Subscription:
     id: str
-    event_types: list[EventType]
-    filter_room: str = ""
-    filter_domain: str = ""
-    callback: str = ""  # reference to registered handler
-    active: bool = True
+    filter: EventFilter
+    handler: Callable
+    created_at: float = field(default_factory=time.time)
     events_received: int = 0
     last_event: float = 0.0
 
 class ForgeListener:
-    def __init__(self, buffer_size: int = 10000):
-        self._buffer: deque = deque(maxlen=buffer_size)
+    def __init__(self, config: ListenerConfig = None):
+        self.config = config or ListenerConfig()
         self._subscriptions: dict[str, Subscription] = {}
-        self._handlers: dict[str, Callable] = {}
-        self._sequence: int = 0
-        self._stats = {"emitted": 0, "delivered": 0, "dropped": 0,
-                      "replays": 0, "buffer_size": buffer_size}
+        self._event_log: deque = deque(maxlen=self.config.max_buffer)
+        self._dead_letter: deque = deque(maxlen=self.config.dead_letter_max)
+        self._pending_ack: dict[str, ForgeEvent] = {}
+        self._stats = {"received": 0, "delivered": 0, "filtered": 0,
+                      "dead_lettered": 0, "expired": 0}
 
-    def emit(self, event_type: str, tile_id: str = "", room: str = "",
-             data: dict = None) -> ForgeEvent:
-        et = EventType(event_type)
-        self._sequence += 1
-        event = ForgeEvent(event_type=et, tile_id=tile_id, room=room,
-                          data=data or {}, sequence=self._sequence)
-        self._buffer.append(event)
-        self._stats["emitted"] += 1
-        # Deliver to matching subscriptions
-        for sub in self._subscriptions.values():
-            if not sub.active:
-                continue
-            if sub.event_types and et not in sub.event_types:
-                continue
-            if sub.filter_room and sub.filter_room != room:
-                continue
-            domain = data.get("domain", "") if data else ""
-            if sub.filter_domain and sub.filter_domain != domain:
-                continue
-            sub.events_received += 1
-            sub.last_event = time.time()
-            self._stats["delivered"] += 1
-            if sub.callback and sub.callback in self._handlers:
-                try:
-                    self._handlers[sub.callback](event)
-                except Exception:
-                    self._stats["dropped"] += 1
-        return event
-
-    def subscribe(self, event_types: list[str] = None, room: str = "",
-                  domain: str = "", handler_name: str = "") -> Subscription:
-        sub_id = f"sub-{len(self._subscriptions)}"
-        types = [EventType(et) for et in event_types] if event_types else []
-        sub = Subscription(id=sub_id, event_types=types, filter_room=room,
-                          filter_domain=domain, callback=handler_name)
-        self._subscriptions[sub_id] = sub
-        return sub
-
-    def register_handler(self, name: str, fn: Callable):
-        self._handlers[name] = fn
+    def subscribe(self, filter: EventFilter, handler: Callable, sub_id: str = "") -> str:
+        sid = sub_id or f"sub-{len(self._subscriptions)}-{int(time.time())}"
+        self._subscriptions[sid] = Subscription(id=sid, filter=filter, handler=handler)
+        return sid
 
     def unsubscribe(self, sub_id: str) -> bool:
         return self._subscriptions.pop(sub_id, None) is not None
 
-    def pause(self, sub_id: str):
-        sub = self._subscriptions.get(sub_id)
-        if sub: sub.active = False
+    def emit(self, event: ForgeEvent):
+        self._stats["received"] += 1
+        self._event_log.append(event)
+        delivered = 0
+        for sub in self._subscriptions.values():
+            if self._matches(event, sub.filter):
+                try:
+                    sub.handler(event)
+                    sub.events_received += 1
+                    sub.last_event = event.timestamp
+                    delivered += 1
+                except Exception as e:
+                    self._dead_letter.append({"event": event, "subscription": sub.id,
+                                             "error": str(e), "timestamp": time.time()})
+                    self._stats["dead_lettered"] += 1
+        if delivered == 0:
+            self._stats["filtered"] += 1
+        else:
+            self._stats["delivered"] += delivered
 
-    def resume(self, sub_id: str):
-        sub = self._subscriptions.get(sub_id)
-        if sub: sub.active = True
+    def emit_simple(self, event_type: str, source: str, payload: dict = None,
+                    severity: str = "info", room: str = ""):
+        event = ForgeEvent(id=f"evt-{int(time.time()*1000)}", event_type=event_type,
+                          source=source, payload=payload or {},
+                          severity=EventSeverity(severity), room=room)
+        self.emit(event)
 
-    def replay(self, from_seq: int = 0, event_types: list[str] = None,
-               room: str = "", limit: int = 100) -> list[ForgeEvent]:
-        types = set(EventType(et) for et in event_types) if event_types else set()
-        events = [e for e in self._buffer if e.sequence >= from_seq
-                 and (not types or e.event_type in types)
-                 and (not room or e.room == room)]
-        self._stats["replays"] += 1
+    def _matches(self, event: ForgeEvent, filt: EventFilter) -> bool:
+        if filt.event_types and event.event_type not in filt.event_types:
+            return False
+        if filt.sources and event.source not in filt.sources:
+            return False
+        if filt.rooms and event.room not in filt.rooms:
+            return False
+        if filt.severities and event.severity not in filt.severities:
+            return False
+        severity_order = {EventSeverity.INFO: 0, EventSeverity.WARNING: 1,
+                         EventSeverity.ERROR: 2, EventSeverity.CRITICAL: 3}
+        if severity_order.get(event.severity, 0) < severity_order.get(filt.min_severity, 0):
+            return False
+        if filt.pattern:
+            payload_str = str(event.payload)
+            if not re.search(filt.pattern, payload_str):
+                return False
+        return True
+
+    def replay(self, event_type: str = "", since: float = 0.0, limit: int = 100) -> list[ForgeEvent]:
+        events = list(self._event_log)
+        if event_type:
+            events = [e for e in events if e.event_type == event_type]
+        if since > 0:
+            events = [e for e in events if e.timestamp >= since]
         return events[-limit:]
 
-    def since(self, timestamp: float, limit: int = 100) -> list[ForgeEvent]:
-        return [e for e in self._buffer if e.timestamp >= timestamp][-limit:]
+    def dead_letters(self, limit: int = 20) -> list[dict]:
+        return list(self._dead_letter)[-limit:]
 
-    def latest(self, n: int = 20) -> list[ForgeEvent]:
-        return list(self._buffer)[-n:]
+    def retry_dead_letters(self) -> int:
+        count = 0
+        while self._dead_letter:
+            entry = self._dead_letter.popleft()
+            event = entry["event"]
+            sub = self._subscriptions.get(entry["subscription"])
+            if sub:
+                try:
+                    sub.handler(event)
+                    count += 1
+                except:
+                    self._dead_letter.append(entry)
+                    break
+        return count
 
-    def room_events(self, room: str, n: int = 50) -> list[ForgeEvent]:
-        return [e for e in self._buffer if e.room == room][-n:]
+    def subscriptions(self) -> list[dict]:
+        return [{"id": s.id, "events_received": s.events_received,
+                "last_event": s.last_event, "filter_types": s.filter.event_types}
+                for s in self._subscriptions.values()]
 
-    def tile_events(self, tile_id: str, n: int = 50) -> list[ForgeEvent]:
-        return [e for e in self._buffer if e.tile_id == tile_id][-n:]
-
-    def clear_buffer(self):
-        self._buffer.clear()
+    def recent_events(self, n: int = 20) -> list[ForgeEvent]:
+        return list(self._event_log)[-n:]
 
     @property
     def stats(self) -> dict:
-        active_subs = sum(1 for s in self._subscriptions.values() if s.active)
         return {**self._stats, "subscriptions": len(self._subscriptions),
-                "active_subscriptions": active_subs, "handlers": len(self._handlers),
-                "sequence": self._sequence, "buffer_used": len(self._buffer)}
+                "buffer_usage": len(self._event_log),
+                "dead_letters": len(self._dead_letter)}

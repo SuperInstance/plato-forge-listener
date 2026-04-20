@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: plato-forge-listener
+Version: 0.1.0
+Summary: Continuous fleet listener — event classification, framing, P0 compliance
+License: MIT
+Requires-Python: >=3.8

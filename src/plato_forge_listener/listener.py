@@ -1,71 +1,128 @@
-"""Continuous fleet event listener with framing pipeline."""
+"""Forge listener — event-driven tile stream consumer with filtering and replay."""
+import time
+import json
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+from collections import defaultdict, deque
+from enum import Enum
 
-from dataclasses import dataclass
-from typing import Optional
+class EventType(Enum):
+    TILE_CREATED = "tile_created"
+    TILE_UPDATED = "tile_updated"
+    TILE_DELETED = "tile_deleted"
+    TILE_GHOSTED = "tile_ghosted"
+    TILE_RESURRECTED = "tile_resurrected"
+    ROOM_CHANGED = "room_changed"
+    FORGE_TICK = "forge_tick"
 
 @dataclass
-class TraceEvent:
-    event_type: str
-    content: str
-    priority: str = "P2"
-    confidence: float = 0.5
-    timestamp: float = 0.0
-    source: str = ""
+class ForgeEvent:
+    event_type: EventType
+    tile_id: str = ""
+    room: str = ""
+    data: dict = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    sequence: int = 0
+
+@dataclass
+class Subscription:
+    id: str
+    event_types: list[EventType]
+    filter_room: str = ""
+    filter_domain: str = ""
+    callback: str = ""  # reference to registered handler
+    active: bool = True
+    events_received: int = 0
+    last_event: float = 0.0
 
 class ForgeListener:
-    def __init__(self, gap_threshold: float = 0.7, max_batch: int = 1000):
-        self.gap_threshold = gap_threshold
-        self.max_batch = max_batch
-        self._events: list[TraceEvent] = []
-        self._gaps: list[dict] = []
+    def __init__(self, buffer_size: int = 10000):
+        self._buffer: deque = deque(maxlen=buffer_size)
+        self._subscriptions: dict[str, Subscription] = {}
+        self._handlers: dict[str, Callable] = {}
+        self._sequence: int = 0
+        self._stats = {"emitted": 0, "delivered": 0, "dropped": 0,
+                      "replays": 0, "buffer_size": buffer_size}
 
-    def classify(self, content: str, confidence: float = 0.5) -> str:
-        c = content.lower()
-        if any(k in c for k in ["error", "fail", "critical", "p0"]):
-            return "P0"
-        if any(k in c for k in ["warning", "important", "p1", "high"]):
-            return "P1"
-        return "P2"
+    def emit(self, event_type: str, tile_id: str = "", room: str = "",
+             data: dict = None) -> ForgeEvent:
+        et = EventType(event_type)
+        self._sequence += 1
+        event = ForgeEvent(event_type=et, tile_id=tile_id, room=room,
+                          data=data or {}, sequence=self._sequence)
+        self._buffer.append(event)
+        self._stats["emitted"] += 1
+        # Deliver to matching subscriptions
+        for sub in self._subscriptions.values():
+            if not sub.active:
+                continue
+            if sub.event_types and et not in sub.event_types:
+                continue
+            if sub.filter_room and sub.filter_room != room:
+                continue
+            domain = data.get("domain", "") if data else ""
+            if sub.filter_domain and sub.filter_domain != domain:
+                continue
+            sub.events_received += 1
+            sub.last_event = time.time()
+            self._stats["delivered"] += 1
+            if sub.callback and sub.callback in self._handlers:
+                try:
+                    self._handlers[sub.callback](event)
+                except Exception:
+                    self._stats["dropped"] += 1
+        return event
 
-    def frame(self, event: TraceEvent) -> dict:
-        is_gap = event.confidence < self.gap_threshold
-        framed = {"prompt": f"Context: {event.source}\nEvent: {event.event_type}",
-                  "completion": event.content, "quality": event.confidence,
-                  "priority": event.priority, "source": event.source,
-                  "gap": is_gap}
-        if is_gap:
-            self._gaps.append({"content": event.content, "confidence": event.confidence,
-                               "priority": event.priority})
-        return framed
+    def subscribe(self, event_types: list[str] = None, room: str = "",
+                  domain: str = "", handler_name: str = "") -> Subscription:
+        sub_id = f"sub-{len(self._subscriptions)}"
+        types = [EventType(et) for et in event_types] if event_types else []
+        sub = Subscription(id=sub_id, event_types=types, filter_room=room,
+                          filter_domain=domain, callback=handler_name)
+        self._subscriptions[sub_id] = sub
+        return sub
 
-    def process(self, content: str, event_type: str = "message",
-                confidence: float = 0.5, source: str = "") -> dict:
-        import time
-        priority = self.classify(content, confidence)
-        event = TraceEvent(event_type=event_type, content=content, priority=priority,
-                           confidence=confidence, timestamp=time.time(), source=source)
-        self._events.append(event)
-        if len(self._events) > self.max_batch:
-            self._events = self._events[-self.max_batch:]
-        return self.frame(event)
+    def register_handler(self, name: str, fn: Callable):
+        self._handlers[name] = fn
 
-    def drain_batch(self, priority: str = None) -> list[dict]:
-        if priority:
-            events = [e for e in self._events if e.priority == priority]
-            self._events = [e for e in self._events if e.priority != priority]
-        else:
-            events = self._events[:]
-            self._events.clear()
-        return [self.frame(e) for e in events]
+    def unsubscribe(self, sub_id: str) -> bool:
+        return self._subscriptions.pop(sub_id, None) is not None
 
-    def drain_gaps(self) -> list[dict]:
-        gaps = self._gaps[:]
-        self._gaps.clear()
-        return gaps
+    def pause(self, sub_id: str):
+        sub = self._subscriptions.get(sub_id)
+        if sub: sub.active = False
+
+    def resume(self, sub_id: str):
+        sub = self._subscriptions.get(sub_id)
+        if sub: sub.active = True
+
+    def replay(self, from_seq: int = 0, event_types: list[str] = None,
+               room: str = "", limit: int = 100) -> list[ForgeEvent]:
+        types = set(EventType(et) for et in event_types) if event_types else set()
+        events = [e for e in self._buffer if e.sequence >= from_seq
+                 and (not types or e.event_type in types)
+                 and (not room or e.room == room)]
+        self._stats["replays"] += 1
+        return events[-limit:]
+
+    def since(self, timestamp: float, limit: int = 100) -> list[ForgeEvent]:
+        return [e for e in self._buffer if e.timestamp >= timestamp][-limit:]
+
+    def latest(self, n: int = 20) -> list[ForgeEvent]:
+        return list(self._buffer)[-n:]
+
+    def room_events(self, room: str, n: int = 50) -> list[ForgeEvent]:
+        return [e for e in self._buffer if e.room == room][-n:]
+
+    def tile_events(self, tile_id: str, n: int = 50) -> list[ForgeEvent]:
+        return [e for e in self._buffer if e.tile_id == tile_id][-n:]
+
+    def clear_buffer(self):
+        self._buffer.clear()
 
     @property
     def stats(self) -> dict:
-        p_counts = {"P0": 0, "P1": 0, "P2": 0}
-        for e in self._events:
-            p_counts[e.priority] = p_counts.get(e.priority, 0) + 1
-        return {"buffered": len(self._events), "gaps": len(self._gaps), "by_priority": p_counts}
+        active_subs = sum(1 for s in self._subscriptions.values() if s.active)
+        return {**self._stats, "subscriptions": len(self._subscriptions),
+                "active_subscriptions": active_subs, "handlers": len(self._handlers),
+                "sequence": self._sequence, "buffer_used": len(self._buffer)}
